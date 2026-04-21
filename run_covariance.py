@@ -54,7 +54,7 @@ if __name__ == "__main__":
                 cos_theta,
                 f_sky=f_sky,
                 Nchi=50,
-                Nphi=40
+                Nmu=40
             )
 
             os.makedirs(os.path.dirname(save_file), exist_ok=True)
