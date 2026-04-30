@@ -74,6 +74,15 @@ def P_e(k, a):
     return float(ccl.halos.halomod_power_spectrum(
         cosmo, hmc, _round(k), _round(a), prof=pE))
 
+def P_e_array(k, a):
+    '''
+    Halo model electron power spectrum.
+    '''
+    return ccl.halos.halomod_power_spectrum(
+        cosmo, hmc, k, a, prof=pE)
+
+
+
 @lru_cache(maxsize=10000)
 def I_1_1(k, a):
     k = _round(k)

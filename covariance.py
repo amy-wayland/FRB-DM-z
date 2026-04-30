@@ -3,9 +3,9 @@ import pyccl as ccl
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from scipy.interpolate import interp1d
-from scipy.special import spherical_jn, eval_legendre
-from scipy.integrate import cumulative_trapezoid
-from core import cosmo, P_e, load_bispectrum
+from scipy.special import spherical_jn, eval_legendre, jv
+from scipy.integrate import cumulative_trapezoid, simpson
+from core import cosmo, P_e, load_bispectrum, P_e_array
 
 # -----------------------------------------------------------
 # Load Bispectrum
@@ -58,6 +58,19 @@ chi_of_z_interp = interp1d(zz, chis, bounds_error=False, fill_value="extrapolate
 z_of_chi_interp = interp1d(chis, zz, bounds_error=False, fill_value="extrapolate")
 W_interp = interp1d(chis, W_chi, bounds_error=False, fill_value=0.0)
 
+
+k_interp = np.geomspace(1e-4,1e2,500)
+a_interp = np.linspace(.2, 1, 100)
+Pe_arr = P_e_array(k_interp, a_interp)
+Pe_interpolator = ccl.pk2d.Pk2D(a_arr = a_interp,
+                                lk_arr = np.log(k_interp),
+                                pk_arr = np.log(Pe_arr),
+                                extrap_order_lok=1,
+                                extrap_order_hik=1,
+                                is_logp=True)
+
+
+
 def E_of_chi(chi):
     z = z_of_chi_interp(chi)
     a = 1/(1+z)
@@ -77,6 +90,8 @@ def W_single_FRB(chi, chi_s):
     z = float(z_of_chi_interp(chi))
     return A * (1+z) * 1e6  # same units as W_chi [pc cm^{-3}]
 
+import time
+
 def C_ij_ell(ell, zi, zj, Nchi=100):
     '''
     Angular power spectrum C_ij(ell) under the Limber approximation.
@@ -86,29 +101,39 @@ def C_ij_ell(ell, zi, zj, Nchi=100):
     chi_max = min(chi_i, chi_j)
     chi_arr = np.linspace(1e-2, chi_max, Nchi)
 
-    integrand = np.zeros(Nchi)
-    for idx, chi in enumerate(chi_arr):
-        z = float(z_of_chi_interp(chi))
-        a = 1/(1+z)
-        k = (ell+0.5)/chi
-        k = np.clip(k, 1e-3, 1e2)
-        Wi = W_single_FRB(chi, chi_i)
-        Wj = W_single_FRB(chi, chi_j)
-        Pe = P_e(k, a)
-        integrand[idx] = Wi*Wj*Pe/chi**2
-
+    z_arr = z_of_chi_interp(chi_arr)
+    a_arr = 1 / (1 + z_arr)
+    k_arr = np.clip((ell + 0.5) / chi_arr, 1e-3, 1e2)
+    # All chi in chi_arr <= chi_max <= min(chi_i, chi_j), so both kernels are non-zero
+    W_arr = A * (1 + z_arr) * 1e6
+    Pe_arr = np.diag(Pe_interpolator(k_arr,a_arr))
+    integrand = W_arr**2 * Pe_arr / chi_arr**2
     return np.trapz(integrand, chi_arr)
 
-def cov_DD(zi, zj, cos_theta, ell_max=500, Nchi=100):
+def cov_DD(zi, zj, cos_theta, ell_max=500, Nchi=100, flat_sky=True):
     '''
-    Full DM-DM auto-covariance summed over multipoles 
-    (Eq. 18 of Reischke & Hagstotz 2023).
+    DM-DM auto-covariance summed over multipoles.
+
+    By default this uses the original full-sky Legendre expansion.
+    If flat_sky=True, it uses the flat-sky Bessel-integral approximation:
+        Cov(theta) = int d ell [ell / (2 pi)] J_0(ell theta) C_ij(ell).
     '''
-    ell_arr = np.unique(np.round(np.logspace(0, np.log10(ell_max), 60)).astype(int))
+    ell_arr = np.unique(np.round(np.logspace(0, np.log10(500), 100)).astype(int))
     C_ell_arr = np.array([C_ij_ell(ell, zi, zj, Nchi=Nchi) for ell in ell_arr])
-    P_ell_arr = np.array([float(eval_legendre(ell, cos_theta)) for ell in ell_arr])
-    integrand = (2*ell_arr + 1) / (4*np.pi) * P_ell_arr * C_ell_arr
-    return np.trapz(integrand, ell_arr)
+
+    if not flat_sky:
+        P_ell_arr = np.array([float(eval_legendre(ell, cos_theta)) for ell in ell_arr])
+        integrand = (2 * ell_arr + 1) / (4 * np.pi) * P_ell_arr * C_ell_arr
+        return np.trapz(integrand, ell_arr)
+
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    theta = np.arccos(cos_theta)
+    ell_integral = np.geomspace(ell_arr[0], ell_arr[-1], int(1e5))
+    C_ell_interp = np.interp(ell_integral, ell_arr, C_ell_arr)
+    bessel = jv(0, ell_integral * theta)
+    integrand = ell_integral * C_ell_interp * bessel
+
+    return simpson(integrand, x=ell_integral) / (2.0 * np.pi)
 
 # -----------------------------------------------------------
 # Cl^{DD} Auto-Covariance
@@ -122,25 +147,22 @@ def C_ell_DD(ell, Nchi=100):
     chi_max = float(ccl.comoving_radial_distance(cosmo, 1/(1+2.0)))
     chi_arr = np.linspace(1e-2, chi_max, Nchi)
 
-    integrand = np.zeros(Nchi)
-    for idx, chi in enumerate(chi_arr):
-        z = float(z_of_chi_interp(chi))
-        a = 1 / (1 + z)
-        k = np.clip((ell + 0.5) / chi, 1e-3, 1e2)
-        W = float(W_interp(chi))
-        Pe = P_e(k, a)
-        integrand[idx] = W**2 * Pe / chi**2
-
+    z_arr = z_of_chi_interp(chi_arr)
+    a_arr = 1 / (1 + z_arr)
+    k_arr = np.clip((ell + 0.5) / chi_arr, 1e-3, 1e2)
+    W_arr = W_interp(chi_arr)
+    Pe_arr = np.diag(Pe_interpolator(k_arr,a_arr))
+    integrand = W_arr**2 * Pe_arr / chi_arr**2
     return np.trapz(integrand, chi_arr)
 
-def cov_ClCl(ell, ell_prime, f_sky=1.0, Nchi=100):
+def cov_ClCl(ell, ell_prime, f_sky=1.0, Nchi=100, delta_ell=1):
     '''
     Gaussian (Knox) covariance of the DM power spectrum.
     '''
     if ell != ell_prime:
         return 0.0
     C = C_ell_DD(ell, Nchi=Nchi)
-    return 2.0 / (2*ell + 1) / f_sky * C**2
+    return 2.0 / (2*ell + 1) / f_sky  * C**2
 
 # -----------------------------------------------------------
 # Cross-Covariance
@@ -182,12 +204,11 @@ def covariance_DM_Cl(ell, z1, z2, z3, Nchi=20, Nmu=40):
 
     # Precompute geometry
     chi_s = chi1_max
-    W1_arr = np.array([W_single_FRB(chi, chi_s) for chi in chi1_arr]) 
-    W2_arr = W_interp(chi2_arr)
-    W3_arr = W_interp(chi3_arr)
-
     z1_arr = z_of_chi_interp(chi1_arr)
     a1_arr = 1 / (1 + z1_arr)
+    W1_arr = np.where(chi1_arr < chi_s, A * (1 + z1_arr) * 1e6, 0.0)
+    W2_arr = W_interp(chi2_arr)
+    W3_arr = W_interp(chi3_arr)
 
     E1_arr = E_of_chi(chi1_arr)
     E2_arr = E_of_chi(chi2_arr)
@@ -204,33 +225,37 @@ def covariance_DM_Cl(ell, z1, z2, z3, Nchi=20, Nmu=40):
     G2 = W2_arr / (chi2_arr * E2_arr)
     G3 = W3_arr / (chi3_arr**2 * E3_arr)
 
-    phi_template = np.zeros((len(mu_arr), 4))
-    phi_template[:, 3] = np.arccos(mu_arr)
-
-    result = 0.0
+    phi_arr = np.arccos(mu_arr)  # shape: (Nmu,)
     prefactor = ((ell + 0.5)**3) / (4 * np.pi**2) * chi_H**3
 
-    for i1 in range(Nchi):
-        a1 = a1_arr[i1]
-        for i2 in range(Nchi):
-            k2 = k2_arr[i2]
-            for i3 in range(Nchi):
-                k3 = k3_arr[i3]
-                phi_template[:, 0] = a1
-                phi_template[:, 1] = k2
-                phi_template[:, 2] = k3
-                B_vals = B_interp(phi_template)
+    # Build all (i1, i2, i3, mu) evaluation points for B_interp at once.
+    # B_interp axes: (a, k2, k3, phi). Broadcast to shape (Nchi, Nchi, Nchi, Nmu).
+    a1_pts  = np.broadcast_to(a1_arr[:, None, None, None], (Nchi, Nchi, Nchi, Nmu))
+    k2_pts  = np.broadcast_to(k2_arr[None, :, None, None], (Nchi, Nchi, Nchi, Nmu))
+    k3_pts  = np.broadcast_to(k3_arr[None, None, :, None], (Nchi, Nchi, Nchi, Nmu))
+    phi_pts = np.broadcast_to(phi_arr[None, None, None, :], (Nchi, Nchi, Nchi, Nmu))
 
-                k1_arr = np.sqrt(k2**2 + k3**2 + 2*k2*k3*mu_arr)
-                k1_arr = np.clip(k1_arr, k_grid_min, k_grid_max)
-                j0_arr = spherical_jn(0, k1_arr * chi1_arr[i1])
+    pts = np.stack([a1_pts.ravel(), k2_pts.ravel(),
+                    k3_pts.ravel(), phi_pts.ravel()], axis=-1)
+    B_4d = B_interp(pts).reshape(Nchi, Nchi, Nchi, Nmu)
 
-                integrand_mu = j0_arr * Pell_arr * B_vals
-                mu_integral = np.trapz(integrand_mu, mu_arr)
-                weight = G1[i1] * G2[i2] * G3[i3]
-                result += weight * mu_integral
+    # k1 and j0: shape (Nchi, Nchi, Nchi, Nmu)
+    k2_bc   = k2_arr[None, :, None, None]
+    k3_bc   = k3_arr[None, None, :, None]
+    mu_bc   = mu_arr[None, None, None, :]
+    chi1_bc = chi1_arr[:, None, None, None]
 
-    result *= prefactor * dchi1 * dchi2 * dchi3
+    k1_4d = np.clip(
+        np.sqrt(k2_bc**2 + k3_bc**2 + 2*k2_bc*k3_bc*mu_bc),
+        k_grid_min, k_grid_max)
+    j0_4d = spherical_jn(0, k1_4d * chi1_bc)
+
+    # Integrate over mu: shape (Nchi, Nchi, Nchi)
+    mu_integrals = np.trapz(
+        j0_4d * Pell_arr[None, None, None, :] * B_4d, mu_arr, axis=-1)
+
+    G_3d = G1[:, None, None] * G2[None, :, None] * G3[None, None, :]
+    result = np.sum(G_3d * mu_integrals) * prefactor * dchi1 * dchi2 * dchi3
     return result / Mpc_to_pc
 
 # -----------------------------------------------------------
@@ -238,7 +263,8 @@ def covariance_DM_Cl(ell, z1, z2, z3, Nchi=20, Nmu=40):
 # -----------------------------------------------------------
 
 def build_covariance_matrix(ell, z_frb, cos_theta_matrix,
-                            f_sky=0.7, Nchi=50, Nmu=40):
+                            f_sky=0.7, Nchi=50, Nmu=40,
+                            flat_sky=False, delta_ell=1):
     '''
     Build the full (N+1)x(N+1) covariance matrix:
     C = [Cov[D_i, D_j]    Cov[D_i, C_ell]  ]
@@ -252,10 +278,13 @@ def build_covariance_matrix(ell, z_frb, cos_theta_matrix,
     print("Computing Cov[D_i, D_j]...")
     for i in range(N):
         for j in range(i, N):
-            val = cov_DD(z_frb[i], z_frb[j], cos_theta_matrix[i, j], Nchi=Nchi)
+            val = cov_DD(
+                z_frb[i], z_frb[j], cos_theta_matrix[i, j],
+                Nchi=Nchi, flat_sky=flat_sky
+            )
             cov[i, j] = val
             cov[j, i] = val
-            print(f"  ({i},{j}): {val:.3e}", end='\r')
+            print(f"  ({i},{j}): {val:.3e}")#, end='\r')
     print()
 
     # Blocks 2 and 3: Cov[D_i, C_ell],  shape (N, 1) and (1, N)
@@ -273,7 +302,7 @@ def build_covariance_matrix(ell, z_frb, cos_theta_matrix,
 
     # Block 4: Cov[C_ell, C_ell], scalar
     print("Computing Cov[C_ell, C_ell]...")
-    cov[N, N] = cov_ClCl(ell, ell, f_sky=f_sky, Nchi=Nchi)
+    cov[N, N] = cov_ClCl(ell, ell, f_sky=f_sky, Nchi=Nchi, delta_ell=delta_ell)
     print(f"  {cov[N,N]:.3e}")
 
     # Correlation coefficient
@@ -337,8 +366,6 @@ def plot_correlation_matrix(corr, z_frb, ell, f_sky=1.0):
 
     plt.tight_layout()
     plt.savefig(f'cov/correlation_matrix_ell{ell}.pdf', format="pdf", bbox_inches="tight")
-    plt.show()
-
-    return fig
+    #plt.show()
 
     return fig
